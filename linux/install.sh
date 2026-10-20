@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+# The source archive must remain read-only/clean during an in-place update.
+# Python imports run from this directory; never accumulate __pycache__ files.
+export PYTHONDONTWRITEBYTECODE=1
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP="$HOME/.local/share/DirectInternetMethod"
 BIN="$HOME/.local/bin"
@@ -8,6 +11,9 @@ DESKTOP="$HOME/.local/share/applications"
 ICONS="$HOME/.local/share/icons/hicolor/scalable/apps"
 USER_TRANSACTION="$HERE/app/user_update_transaction.py"
 TRANSACTION_ACTIVE=0
+ROOT_UPGRADE_STAGED=0
+# R779: a rollback must never execute user-writable package code as Root.
+ROOT_TRANSACTION="/var/lib/directinternetmethod/upgrade-guard/root_tx.py"
 rollback_failed_install() {
   local code="$1"
   trap - ERR HUP INT TERM
@@ -15,6 +21,11 @@ rollback_failed_install() {
     if ! python3 "$USER_TRANSACTION" --rollback; then
       echo "DEGRADED: code rollback requires review; user settings have not been deleted." >&2
       echo "Inspect $HOME/.local/state/DirectInternetMethod/update-pending" >&2
+    fi
+  fi
+  if [ "$ROOT_UPGRADE_STAGED" -eq 1 ] && [ -f /var/lib/directinternetmethod/upgrade-pending/manifest.json ]; then
+    if ! pkexec /usr/bin/python3 "$ROOT_TRANSACTION" rollback; then
+      echo 'DEGRADED: protected backend rollback failed; preserve exact root slot for review.' >&2
     fi
   fi
   exit "$code"
@@ -64,7 +75,7 @@ backend_matches_current() {
   python3 - /var/lib/directinternetmethod/install.json "$uid" <<'PY' >/dev/null 2>&1 || return 1
 import json,sys
 d=json.load(open(sys.argv[1],encoding="utf-8"))
-raise SystemExit(0 if d.get("version") in ("1.5.1","1.5.2","1.5.3","1.5.4") and str(d.get("uid"))==sys.argv[2] else 1)
+raise SystemExit(0 if d.get("version")=="1.5.6" and str(d.get("uid"))==sys.argv[2] else 1)
 PY
   [ "$(cat /etc/directinternetmethod.uid 2>/dev/null || true)" = "$uid" ] || return 1
   for action in start stop recovery; do
@@ -76,6 +87,8 @@ PY
   done <<EOF
 $HERE/app/direct_method_helper.sh|/usr/lib/directinternetmethod/direct_method_helper.sh
 $HERE/system/selective_dns.py|/usr/lib/directinternetmethod/selective_dns.py
+$HERE/system/encrypted_selective_dns.py|/usr/lib/directinternetmethod/encrypted_selective_dns.py
+$HERE/system/encrypted_selective_policy.py|/usr/lib/directinternetmethod/encrypted_selective_policy.py
 $HERE/system/control.sh|/usr/lib/directinternetmethod/control.sh
 $HERE/system/uninstall_system.sh|/usr/lib/directinternetmethod/uninstall_system.sh
 $HERE/app/hosts.txt|/usr/lib/directinternetmethod/direct_hosts.txt
@@ -88,19 +101,36 @@ $HERE/licenses/LICENSE-zapret.txt|/usr/lib/directinternetmethod/licenses/LICENSE
 EOF
 }
 
+# R781: A privileged entry must be an OS-provisioned, Root-owned fixed script.
+# Neither Root Bash nor Python may execute source from this user-owned package.
+TRUSTED_BOOTSTRAP="/usr/local/libexec/directinternetmethod/privileged_entry.py"
+trusted_bootstrap_ready() {
+  [ -f "$TRUSTED_BOOTSTRAP" ] &&
+  [ ! -L "$TRUSTED_BOOTSTRAP" ] &&
+  [ "$(stat -c %u -- "$TRUSTED_BOOTSTRAP")" = 0 ] &&
+  [ "$(stat -c %g -- "$TRUSTED_BOOTSTRAP")" = 0 ] &&
+  [ "$(stat -c %a -- "$TRUSTED_BOOTSTRAP")" = 500 ] &&
+  [ "$(stat -c %h -- "$TRUSTED_BOOTSTRAP")" = 1 ]
+}
 # Administrative authorization is required only when the protected backend is absent or differs.
 if backend_matches_current; then
   echo "Protected backend already matches current package; keeping root-owned code unchanged."
 else
-  # A running/installed protected backend is NOT an atomic user-level update:
-  # never replace it in-place without an independently accepted root rollback.
-  if [ -e /var/lib/directinternetmethod/install.json ] ||
-     [ -e /usr/lib/directinternetmethod ]; then
-    echo "Protected backend differs; update refused until root rollback is verified. User data and old backend preserved." >&2
+  if ! trusted_bootstrap_ready; then
+    echo "R781_TRUSTED_BOOTSTRAP_NOT_PROVISIONED: OS administrator must approve an independently verified, Root-owned bootstrap. No package code ran as Root." >&2
+    rollback_failed_install 87
+  fi
+  if [ -f /var/lib/directinternetmethod/install.json ] &&
+     [ -d /usr/lib/directinternetmethod ]; then
+    ROOT_UPGRADE_STAGED=1
+    pkexec /usr/bin/python3 -I "$TRUSTED_BOOTSTRAP" --action upgrade --source "$HERE"
+  elif [ ! -e /var/lib/directinternetmethod/install.json ] &&
+       [ ! -e /usr/lib/directinternetmethod ]; then
+    pkexec /usr/bin/python3 -I "$TRUSTED_BOOTSTRAP" --action install --source "$HERE"
+  else
+    echo 'Foreign/partial root backend; no mutation authorized.' >&2
     rollback_failed_install 25
   fi
-  # Only a genuinely fresh root-backend install may request PolicyKit.
-  pkexec /bin/bash "$HERE/system/install_system.sh" "$HERE" "$(id -u)"
 fi
 backend_matches_current || { echo "Protected backend verification failed." >&2; rollback_failed_install 22; }
 # Atomically replace version-managed code in the ONE installed app directory.
@@ -199,11 +229,11 @@ for name, expected in expected_launchers.items():
         launchers[name]=hashlib.sha256(expected).hexdigest()
 transaction=json.loads((pathlib.Path.home()/".local/state/DirectInternetMethod/update-pending/manifest.json").read_text(encoding="utf8"))
 protected=json.loads(pathlib.Path("/var/lib/directinternetmethod/install.json").read_text(encoding="utf-8"))
-assert protected.get("version") in ("1.5.1","1.5.2","1.5.3","1.5.4")
+assert protected.get("version") == "1.5.6"
 metadata=json.dumps({
   "schema":2,
   "product":"Direct Internet Method",
-  "version":"1.5.4",
+  "version":"1.5.6",
   "platform":"linux-x86_64",
   "installedUtc":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),
   "networkMutationOnInstall":False,
@@ -229,11 +259,18 @@ spec.loader.exec_module(transaction_helper)
 transaction_helper.atomic_bytes(pathlib.Path(sys.argv[1]),metadata.encode("utf-8"),0o600)
 PY
 
-# Commit only after managed code and mutable data hashes are reverified.
-# On success, the one temporary rollback slot is removed; no dated copies remain.
-python3 "$USER_TRANSACTION" --commit
-TRANSACTION_ACTIVE=0
-trap - ERR HUP INT TERM
-echo "Updated Direct Internet Method 1.5.4 in place; user data preserved."
+# Unreleased candidate: protected Root must complete REAL native acceptance.
+# Retain one bounded user/root rollback slot, not a permanent duplicate install.
+if [ "$ROOT_UPGRADE_STAGED" -eq 1 ]; then
+  python3 "$USER_TRANSACTION" --status
+  TRANSACTION_ACTIVE=0
+  trap - ERR HUP INT TERM
+  echo 'R519_CANDIDATE_PENDING_NATIVE_ROOT_USER_COMMIT: in-place files updated; not Released.'
+else
+  python3 "$USER_TRANSACTION" --commit
+  TRANSACTION_ACTIVE=0
+  trap - ERR HUP INT TERM
+  echo 'R519_CANDIDATE_FRESH_USER_CODE_COMMITTED: native release acceptance OPEN.'
+fi
 echo "Normal Start / Stop / Recovery do not require an admin password."
 echo "Install/update/uninstall of the protected backend may authenticate once."
