@@ -1,7 +1,7 @@
 # Direct Internet Method
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/TandemVector-Labs/.github/main/brand/social/DirectInternetMethod.png" alt="Direct Internet Method visual project card" width="720">
+  <img src="assets/project-cover.svg" alt="Direct Internet Method — conceptual vector project artwork, not a product screenshot" width="960">
 </p>
 
 ## Current public release: v1.5.4 Stable (.NET 10 LTS)
